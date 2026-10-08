@@ -1,10 +1,12 @@
 // Discord front end for a chat model and a classifier.
 //
 //   @mention or reply to the bot      chat, with the channel's recent messages as context
-//   DM the bot                        same, in private
+//   reply to a message + @mention     with a yes/no question ("is this a dumb question?"):
+//                                     the classifier's verdict on that message, narrated
+//   DM the bot                        same as a mention, in private
 //   /chat prompt [think]              chat, with channel context when the bot can read it
 //   /vibecheck [messages]             the classifier reads the room
-//   /classify yesno|choose|score      classify text
+//   /classify yesno|choose|score      judge the channel's recent conversation, or some text
 //   Apps > Classify                   classify an existing message
 //   /models                           which models answer, and whether they are up
 //
@@ -27,22 +29,26 @@ import {
   ModalBuilder,
   Partials,
   SlashCommandBuilder,
+  type SlashCommandStringOption,
   TextInputBuilder,
   TextInputStyle,
   Team,
+  type Channel,
   type ChatInputCommandInteraction,
   type Interaction,
   type Message,
   type RepliableInteraction,
 } from "discord.js";
-import type { ClassifierAnswer, ClassifierQuestion } from "@earendil-works/pi-ai";
-import { describe, line, read, systemPrompt, type Scene } from "./context.ts";
+import type { ClassifierAnswer, ClassifierQuestion, JsonValue } from "@earendil-works/pi-ai";
+import { describe, line, read, systemPrompt, type Line, type Scene } from "./context.ts";
 import { connect, type Chat, type ChatRequest, type Classifier } from "./models.ts";
 
 const MAX_TEXT = 4000;
 const installs = [ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall];
 const contexts = [InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel];
 const ids = (raw?: string) => new Set((raw ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+const textOption = (o: SlashCommandStringOption) =>
+  o.setName("text").setDescription("Text to judge instead of this channel's recent conversation");
 
 const chatCommands = [
   new SlashCommandBuilder()
@@ -65,35 +71,37 @@ const classifyCommands = [
     ),
   new SlashCommandBuilder()
     .setName("classify")
-    .setDescription("Classify text")
+    .setDescription("Judge the conversation here, or some text, against a question")
     .setIntegrationTypes(installs)
     .setContexts(contexts)
     .addSubcommand((sub) =>
       sub
         .setName("yesno")
-        .setDescription("Yes/no: how likely is the answer yes?")
-        .addStringOption((o) => o.setName("text").setDescription("The text to classify").setRequired(true))
-        .addStringOption((o) => o.setName("question").setDescription("A yes/no question about the text").setRequired(true)),
+        .setDescription("How likely is the answer yes?")
+        .addStringOption((o) =>
+          o.setName("question").setDescription("e.g. is anyone actually mad right now?").setRequired(true),
+        )
+        .addStringOption(textOption),
     )
     .addSubcommand((sub) =>
       sub
         .setName("choose")
         .setDescription("Pick the best of several labels")
-        .addStringOption((o) => o.setName("text").setDescription("The text to classify").setRequired(true))
-        .addStringOption((o) => o.setName("question").setDescription("What to decide").setRequired(true))
+        .addStringOption((o) => o.setName("question").setDescription("e.g. what are we talking about?").setRequired(true))
         .addStringOption((o) =>
-          o.setName("options").setDescription("Comma-separated labels, e.g. bug, feature, question").setRequired(true),
-        ),
+          o.setName("options").setDescription("Comma-separated labels, e.g. homelab, melee, food").setRequired(true),
+        )
+        .addStringOption(textOption),
     )
     .addSubcommand((sub) =>
       sub
         .setName("score")
-        .setDescription("Rate the text on a scale")
-        .addStringOption((o) => o.setName("text").setDescription("The text to classify").setRequired(true))
-        .addStringOption((o) => o.setName("question").setDescription("What to rate").setRequired(true))
+        .setDescription("Rate on a scale")
+        .addStringOption((o) => o.setName("question").setDescription("e.g. how productive is this chat?").setRequired(true))
         .addStringOption((o) =>
           o.setName("levels").setDescription("Comma-separated levels, lowest first (default: low, medium, high)"),
-        ),
+        )
+        .addStringOption(textOption),
     ),
   new ContextMenuCommandBuilder()
     .setName("Classify")
@@ -179,7 +187,7 @@ const busy = new Set<string>();
 
 async function mentioned(message: Message) {
   const me = client.user!.id;
-  if (!chat || message.author.bot) return;
+  if ((!chat && !classifier) || message.author.bot) return;
   const direct = !message.inGuild();
   const addressed =
     direct || message.mentions.users.has(me) || message.mentions.repliedUser?.id === me;
@@ -201,12 +209,26 @@ async function mentioned(message: Message) {
     const handle = `@${message.guild?.members.me?.displayName ?? client.user!.displayName}`;
     const stripped = asker.text.startsWith(handle) ? asker.text.slice(handle.length).replace(/^[,:]?\s*/u, "") : asker.text;
     const prompt = stripped || "(just pinged you)";
+
+    // Replying to someone's message with a yes/no question about it gets a verdict.
+    const target = await repliedTo(message, me);
+    if (target && classifier && (await isYesNo(classifier, prompt))) {
+      clearInterval(typing);
+      return await judge(message, classifier, target, asker.author, prompt, scene);
+    }
+    if (!chat) return;
+
+    const about = target ? ` (replying to ${target.author}'s message: "${target.text}")` : "";
     let reply: Message | undefined;
     await converse(
       chat,
       {
-        system: systemPrompt(client.user!.displayName, scene, `${asker.author}, who just said this to you`),
-        prompt: `${asker.author}: ${prompt}`,
+        system: systemPrompt(
+          client.user!.displayName,
+          scene,
+          `${asker.author}, who just said this to you${target ? `, about ${target.author}'s message` : ""}`,
+        ),
+        prompt: `${asker.author}${about}: ${prompt}`,
         think: prompt.includes("🧠"),
       },
       {
@@ -222,6 +244,74 @@ async function mentioned(message: Message) {
     clearInterval(typing);
     busy.delete(message.channelId);
   }
+}
+
+// The message this one replies to, unless it's one of ours (then the reply
+// just continues the conversation).
+async function repliedTo(message: Message, me: string): Promise<Line | undefined> {
+  if (!message.reference?.messageId) return undefined;
+  const referenced = await message.fetchReference().catch(() => undefined);
+  if (!referenced || referenced.author.id === me) return undefined;
+  const target = line(referenced, me);
+  return target.text.trim() ? target : undefined;
+}
+
+// Yes/no questions start like one; the classifier then tells "can this run on
+// a Pi?" (a verdict) from "can you summarize this?" (a request for chat).
+const YES_NO_START =
+  /^(is|are|am|was|were|do|does|did|can|could|will|would|should|shall|has|have|had|may|might|must|isn't|aren't|wasn't|doesn't|didn't|can't|won't|wouldn't|shouldn't)\b/iu;
+
+async function isYesNo(classifier: Classifier, prompt: string) {
+  if (!YES_NO_START.test(prompt.trim())) return false;
+  const result = await classifier.classify({
+    state: { text: prompt },
+    questions: {
+      kind: {
+        type: "choice",
+        instructions: "What kind of message is this?",
+        criteria: {
+          yesno: "a question answerable with yes or no",
+          request: "asks to explain, summarize, roast, fix, or give an opinion",
+          chatter: "a reaction or small talk, not a question",
+        },
+      },
+    },
+  });
+  const kind = result.answers.kind;
+  return result.stopReason === "stop" && kind?.type === "choice" && kind.choice === "yesno";
+}
+
+// The classifier's yes/no verdict on `target`, then a one-liner from the chat
+// model backing it up.
+async function judge(message: Message, classifier: Classifier, target: Line, asker: string, question: string, scene: Scene) {
+  const result = await classifier.classify({ state: messageSubject(target).state, questions: { q: bool(question) } });
+  const answer = result.answers.q;
+  if (result.stopReason !== "stop" || answer?.type !== "bool") {
+    await message.reply(`⚠️ ${classifier.name} failed: ${result.errorMessage ?? result.stopReason}`.slice(0, 2000));
+    return;
+  }
+
+  const yes = answer.probability >= 0.5;
+  const head = `**${yes ? "Yes" : "No"}** ${bar(answer.probability)}`;
+  const credit = `-# ${classifier.name} judged ${target.author}'s message${chat ? ` · ${chat.name} narrates` : ""}`;
+  const reply = await message.reply(`${head}\n${credit}`);
+  if (!chat) return;
+
+  let quip = "";
+  const narrated = await chat.ask(
+    {
+      system: systemPrompt(client.user!.displayName, scene, `${asker}, who asked you to judge ${target.author}'s message`),
+      prompt:
+        `${asker} asked about ${target.author}'s message "${target.text}": "${question}" ` +
+        `A classifier answered ${yes ? "yes" : "no"} (${Math.round(answer.probability * 100)}% yes). ` +
+        "Write ONE short, funny line (max 25 words) backing up that verdict. Playful, never mean-spirited. " +
+        "Don't restate the percentage.",
+      think: false,
+    },
+    (text) => (quip = text),
+  );
+  if (narrated.stopReason !== "stop" || !quip.trim()) return;
+  await reply.edit(`${head}\n${quip.trim().replace(/^"|"$/g, "")}\n${credit}`.slice(0, 2000));
 }
 
 interface Surface {
@@ -308,14 +398,7 @@ async function vibecheck(interaction: ChatInputCommandInteraction, classifier: C
     (l) => !l.mine,
   );
   if (lines.length < 3) {
-    return fail(
-      interaction,
-      !readsChannels
-        ? "I can't read channels yet: the Message Content intent is off in the Developer Portal."
-        : lines.length
-          ? "Not enough chatter here to read the room yet."
-          : "I can't read this channel. Add me to the server (not just as a user app) and I'll vibecheck it.",
-    );
+    return fail(interaction, lines.length ? "Not enough chatter here to read the room yet." : unreadable());
   }
 
   const where = describe(interaction.channel, interaction.guild?.name);
@@ -419,8 +502,8 @@ async function handle(interaction: Interaction) {
   }
 
   if (interaction.isMessageContextMenuCommand()) {
-    const text = interaction.targetMessage.content.trim();
-    if (!text) return fail(interaction, "That message has no text to classify.");
+    const target = line(interaction.targetMessage, client.user!.id);
+    if (!target.text.trim()) return fail(interaction, "That message has no text to classify.");
     const modal = new ModalBuilder()
       .setCustomId(`classify:${interaction.targetId}`)
       .setTitle("Classify this message")
@@ -443,18 +526,19 @@ async function handle(interaction: Interaction) {
             .setMaxLength(300),
         ),
       );
-    pending.set(interaction.targetId, text);
+    pending.set(interaction.targetId, target);
     return interaction.showModal(modal);
   }
 
   if (interaction.isModalSubmit() && interaction.customId.startsWith("classify:")) {
     const id = interaction.customId.slice("classify:".length);
-    const text = pending.get(id);
+    const target = pending.get(id);
     pending.delete(id);
-    if (!text) return fail(interaction, "That form expired; try again.");
+    if (!target) return fail(interaction, "That form expired; try again.");
     const question = interaction.fields.getTextInputValue("question");
     const choices = labels(interaction.fields.getTextInputValue("options"));
-    return classify(interaction, classifier, text, question, choices.length >= 2 ? choice(question, choices) : bool(question));
+    const asked = choices.length >= 2 ? choice(question, choices) : bool(question);
+    return classify(interaction, classifier, messageSubject(target), question, asked);
   }
 
   if (interaction.isChatInputCommand() && interaction.commandName === "classify") {
@@ -462,8 +546,8 @@ async function handle(interaction: Interaction) {
   }
 }
 
-// Message text waiting for its modal to come back, keyed by message ID.
-const pending = new Map<string, string>();
+// Messages waiting for their modal to come back, keyed by message ID.
+const pending = new Map<string, Line>();
 
 function labels(raw: string | null) {
   return (raw ?? "").split(",").map((label) => label.trim()).filter(Boolean);
@@ -481,37 +565,78 @@ const choice = (instructions: string, options: string[]): ClassifierQuestion => 
   criteria: Object.fromEntries(options.map((option) => [option, option])),
 });
 
+// What the classifier judges, and how the reply shows it.
+interface Subject {
+  state: Record<string, JsonValue>;
+  preview: string;
+}
+
+function textSubject(text: string): Subject {
+  return { state: { text: text.slice(0, MAX_TEXT) }, preview: `>>> ${text.length > 400 ? `${text.slice(0, 400)}…` : text}` };
+}
+
+function messageSubject(message: Line): Subject {
+  return {
+    state: { message: { author: message.author, text: message.text.slice(0, MAX_TEXT) } },
+    preview: `>>> **${message.author}:** ${message.text.length > 400 ? `${message.text.slice(0, 400)}…` : message.text}`,
+  };
+}
+
+// The channel's recent conversation (without the bot's own messages), oldest
+// first and trimmed to fit; undefined when the bot can't read the channel.
+async function channelSubject(channel: Channel | null, guildName?: string, limit = 30): Promise<Subject | undefined> {
+  const where = describe(channel, guildName);
+  const lines = (await read(channel, client.user!.id, undefined, limit)).filter((l) => !l.mine);
+  if (!lines.length) return undefined;
+  const messages = lines.map((l) => ({ author: l.author, text: l.text }));
+  while (JSON.stringify(messages).length > MAX_TEXT && messages.length > 1) messages.shift();
+  return { state: { channel: where, messages }, preview: `-# the last ${messages.length} messages in ${where}` };
+}
+
+const unreadable = () =>
+  !readsChannels
+    ? "I can't read channels: the Message Content intent is off in the Developer Portal."
+    : "I can't read this channel. Add me to the server (not just as a user app), or pass `text`.";
+
 async function classifyCommand(interaction: ChatInputCommandInteraction, classifier: Classifier) {
-  const text = interaction.options.getString("text", true);
   const question = interaction.options.getString("question", true);
   const sub = interaction.options.getSubcommand();
-  if (sub === "yesno") return classify(interaction, classifier, text, question, bool(question));
-  if (sub === "choose") {
+  let asked: ClassifierQuestion;
+  if (sub === "yesno") {
+    asked = bool(question);
+  } else if (sub === "choose") {
     const options = labels(interaction.options.getString("options"));
     if (options.length < 2) return fail(interaction, "Give at least two comma-separated options.");
-    return classify(interaction, classifier, text, question, choice(question, options));
+    asked = choice(question, options);
+  } else {
+    const levels = labels(interaction.options.getString("levels") ?? "low, medium, high");
+    if (levels.length < 2) return fail(interaction, "Give at least two comma-separated levels.");
+    asked = { type: "score", instructions: question, criteria: levels };
   }
-  const levels = labels(interaction.options.getString("levels") ?? "low, medium, high");
-  if (levels.length < 2) return fail(interaction, "Give at least two comma-separated levels.");
-  return classify(interaction, classifier, text, question, { type: "score", instructions: question, criteria: levels });
+
+  await interaction.deferReply();
+  const text = interaction.options.getString("text");
+  const subject = text ? textSubject(text) : await channelSubject(interaction.channel, interaction.guild?.name);
+  if (!subject) return fail(interaction, unreadable());
+  return classify(interaction, classifier, subject, question, asked);
 }
 
 async function classify(
   interaction: RepliableInteraction,
   classifier: Classifier,
-  text: string,
+  subject: Subject,
   title: string,
   question: ClassifierQuestion,
 ) {
-  await interaction.deferReply();
-  const result = await classifier.classify({ state: { text: text.slice(0, MAX_TEXT) }, questions: { q: question } });
+  if (!interaction.deferred) await interaction.deferReply();
+  const result = await classifier.classify({ state: subject.state, questions: { q: question } });
   if (result.stopReason !== "stop") {
     return fail(interaction, `${classifier.name} failed: ${result.errorMessage ?? result.stopReason}`);
   }
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(title.slice(0, 256))
-    .setDescription(`>>> ${text.length > 400 ? `${text.slice(0, 400)}…` : text}`)
+    .setDescription(subject.preview)
     .addFields(render(result.answers.q, question))
     .setFooter({ text: classifier.name });
   await interaction.editReply({ embeds: [embed] });

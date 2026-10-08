@@ -10,14 +10,19 @@ Laya on the DGX Spark.
 | | Model | Does |
 | --- | --- | --- |
 | **@mention it**, or reply to it | chat | answers in the thread of conversation, having read the channel's recent messages |
+| **Reply to someone's message** and @mention it with a yes/no question (`@bot is this a dumb question?`) | classifier, narrated by chat | a Yes/No verdict on *that* message, plus a one-liner |
 | **DM it** | chat | same, in private |
 | `/chat prompt [think]` | chat | asks directly; sees channel context when it can |
 | `/vibecheck [messages]` | classifier, narrated by chat | reads the room: mood, chaos, beef, and the main character |
-| `/classify yesno\|choose\|score` | classifier | yes/no probability, pick-a-label, or rate on a scale |
+| `/classify yesno\|choose\|score question [text]` | classifier | judges the channel's recent conversation (or `text`): yes/no, pick-a-label, or a scale |
 | Apps → **Classify** on a message | classifier | yes/no, or a choice if you give options |
 | `/models` | both | which models answer, and whether they are up |
 
 Add 🧠 to a mention to let the chat model reason before it answers.
+
+Replying to someone's message with a question like *explain this* or *thoughts?*
+still chats, focused on that message; only yes/no questions get a verdict. The
+classifier decides which is which, so there's no syntax to remember.
 
 ### Channel context
 
